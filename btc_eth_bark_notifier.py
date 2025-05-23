@@ -16,6 +16,7 @@ btc_eth_bark_notifier.py
     INTERVAL   —— 轮询间隔（秒）
 """
 import os
+import sys
 import time
 import requests
 
@@ -52,6 +53,8 @@ def main():
     eth_slot = int(eth_price // ETH_STEP)  # 当前 ETH 所在整数档
     print(f"[INIT] BTC ≈ ${btc_price:,.0f}  ETH ≈ ${eth_price:,.0f}")
     print("[READY] 已开始监控整数节点…")
+    # Flush stdout
+    sys.stdout.flush()
 
     while True:
         try:
@@ -67,6 +70,9 @@ def main():
                     f"BTC {direction} ${final_threshold:,.0f}",
                     f"现价 ≈ ${btc_price:,.0f}"
                 )
+                print(f"[BTC] {direction} ${final_threshold:,.0f} 现价 ≈ ${btc_price:,.0f}")
+                # Flush stdout
+                sys.stdout.flush()
                 btc_slot = new_btc_slot
 
             # 如果跨过一个或多个 ETH 档位
@@ -77,6 +83,9 @@ def main():
                     f"ETH {direction} ${final_threshold:,.0f}",
                     f"现价 ≈ ${eth_price:,.0f}"
                 )
+                print(f"[ETH] {direction} ${final_threshold:,.0f} 现价 ≈ ${eth_price:,.0f}")
+                # Flush stdout
+                sys.stdout.flush()
                 eth_slot = new_eth_slot
 
         except Exception as e:
