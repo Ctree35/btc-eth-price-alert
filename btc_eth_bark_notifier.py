@@ -65,7 +65,7 @@ def main():
             # 如果跨过一个或多个 BTC 档位
             if new_btc_slot != btc_slot:
                 direction = "上升至" if new_btc_slot > btc_slot else "下降至"
-                final_threshold = new_btc_slot * BTC_STEP
+                final_threshold = new_btc_slot * BTC_STEP if new_btc_slot > btc_slot else (new_btc_slot + 1) * BTC_STEP
                 bark_push(
                     f"BTC {direction} ${final_threshold:,.0f}",
                     f"现价 ≈ ${btc_price:,.0f}"
@@ -78,7 +78,7 @@ def main():
             # 如果跨过一个或多个 ETH 档位
             if new_eth_slot != eth_slot:
                 direction = "上升至" if new_eth_slot > eth_slot else "下降至"
-                final_threshold = new_eth_slot * ETH_STEP
+                final_threshold = new_eth_slot * ETH_STEP if new_eth_slot > eth_slot else (new_eth_slot + 1) * ETH_STEP
                 bark_push(
                     f"ETH {direction} ${final_threshold:,.0f}",
                     f"现价 ≈ ${eth_price:,.0f}"
