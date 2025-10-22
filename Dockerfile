@@ -15,7 +15,8 @@ COPY btc_eth_bark_notifier.py .
 # 默认轮询 30 s；可在部署平台用环境变量覆盖
 ENV INTERVAL=30 \
     BTC_STEP=1000 \
-    ETH_STEP=100
+    ETH_STEP=100 \
+    RATIO_STEP=0.5
 
 CMD ["python", "btc_eth_bark_notifier.py"]
 
