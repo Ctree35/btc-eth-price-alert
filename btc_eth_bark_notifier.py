@@ -2,7 +2,8 @@
 """
 btc_eth_bark_notifier.py
 当 BTC 到达新的整数千位 (n*1 000 USD)、
-或 ETH 到达新的整数百位 (n*100 USD) 时，
+或 ETH 到达新的整数百位 (n*100 USD)、
+或 BTC/ETH 比率到达新的 0.5 倍数档位时，
 立刻通过 Bark 推送到 iPhone。
 
 依赖：
@@ -11,9 +12,10 @@ btc_eth_bark_notifier.py
     BARK_KEY   —— 必填，Bark Device Key
     BARK_BASE  —— 选填，Bark 服务器根地址，默认 https://api.day.app
 可调参数：
-    BTC_STEP   —— BTC 步长（默认 1000）
-    ETH_STEP   —— ETH 步长（默认 100）
-    INTERVAL   —— 轮询间隔（秒）
+    BTC_STEP      —— BTC 步长（默认 1000）
+    ETH_STEP      —— ETH 步长（默认 100）
+    RATIO_STEP    —— BTC/ETH 比率步长（默认 0.5）
+    INTERVAL      —— 轮询间隔（秒）
 """
 import os
 import sys
@@ -25,6 +27,7 @@ BARK_KEY   = os.getenv("BARK_KEY",  "YOUR_DEVICE_KEY")
 BARK_BASE  = os.getenv("BARK_BASE", "https://api.day.app")
 BTC_STEP   = int(os.getenv("BTC_STEP",  1000))   # BTC 整数档位步长
 ETH_STEP   = int(os.getenv("ETH_STEP",   100))   # ETH 整数档位步长
+RATIO_STEP = float(os.getenv("RATIO_STEP", 0.5)) # BTC/ETH 比率步长
 INTERVAL   = int(os.getenv("INTERVAL",    30))   # 秒
 
 COINGECKO_URL = (
@@ -51,7 +54,9 @@ def main():
     btc_price, eth_price = fetch_prices()
     btc_slot = int(btc_price // BTC_STEP)  # 当前 BTC 所在整数档
     eth_slot = int(eth_price // ETH_STEP)  # 当前 ETH 所在整数档
-    print(f"[INIT] BTC ≈ ${btc_price:,.0f}  ETH ≈ ${eth_price:,.0f}")
+    ratio = btc_price / eth_price           # BTC/ETH 比率
+    ratio_slot = int(ratio / RATIO_STEP)    # 当前比率所在档位
+    print(f"[INIT] BTC ≈ ${btc_price:,.0f}  ETH ≈ ${eth_price:,.0f}  BTC/ETH ≈ {ratio:.2f}")
     print("[READY] 已开始监控整数节点…")
     # Flush stdout
     sys.stdout.flush()
@@ -61,6 +66,8 @@ def main():
             btc_price, eth_price = fetch_prices()
             new_btc_slot = int(btc_price // BTC_STEP)
             new_eth_slot = int(eth_price // ETH_STEP)
+            ratio = btc_price / eth_price
+            new_ratio_slot = int(ratio / RATIO_STEP)
 
             # 如果跨过一个或多个 BTC 档位
             if new_btc_slot != btc_slot:
@@ -87,6 +94,19 @@ def main():
                 # Flush stdout
                 sys.stdout.flush()
                 eth_slot = new_eth_slot
+
+            # 如果跨过一个或多个 BTC/ETH 比率档位
+            if new_ratio_slot != ratio_slot:
+                direction = "上升至" if new_ratio_slot > ratio_slot else "下降至"
+                final_ratio = new_ratio_slot * RATIO_STEP if new_ratio_slot > ratio_slot else (new_ratio_slot + 1) * RATIO_STEP
+                bark_push(
+                    f"BTC/ETH {direction} {final_ratio:.1f}",
+                    f"现值 ≈ {ratio:.2f}"
+                )
+                print(f"[BTC/ETH] {direction} {final_ratio:.1f} 现值 ≈ {ratio:.2f}")
+                # Flush stdout
+                sys.stdout.flush()
+                ratio_slot = new_ratio_slot
 
         except Exception as e:
             print(f"[ERROR] {e}")
