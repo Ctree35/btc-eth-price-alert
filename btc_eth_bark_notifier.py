@@ -21,6 +21,9 @@ import os
 import sys
 import time
 import requests
+from urllib.parse import quote
+from collections import deque
+from datetime import datetime, timedelta
 
 # ==== 配置（可用环境变量覆盖） ====
 BARK_KEY   = os.getenv("BARK_KEY",  "YOUR_DEVICE_KEY")
@@ -37,9 +40,16 @@ COINGECKO_URL = (
 
 # ==== 推送 ====
 def bark_push(title: str, body: str):
-    url = f"{BARK_BASE}/{BARK_KEY}/{title}/{body}"
+    # URL-encode title and body to handle special characters like "/"
+    encoded_title = quote(title)
+    encoded_body = quote(body)
+    url = f"{BARK_BASE}/{BARK_KEY}/{encoded_title}/{encoded_body}"
     try:
-        requests.get(url, timeout=8)
+        r = requests.get(url, timeout=8)
+        if r.status_code != 200:
+            print(f"[BARK ERROR] {r.status_code} {r.text}")
+            return
+        print(f"[BARK SUCCESS] {r.status_code} {r.text}")
     except requests.RequestException as e:
         print(f"[BARK ERROR] {e}")
 
@@ -49,6 +59,78 @@ def fetch_prices() -> tuple[float, float]:
     data = r.json()
     return data["bitcoin"]["usd"], data["ethereum"]["usd"]
 
+# ==== 历史比率追踪 ====
+class RatioTracker:
+    def __init__(self):
+        # Store (timestamp, ratio) tuples for up to 144 hours
+        self.history = deque()
+        # Track last alerted extremes to avoid duplicate alerts
+        self.last_alerted = {
+            "24h_low": None,
+            "24h_high": None,
+            "72h_low": None,
+            "72h_high": None,
+            "144h_low": None,
+            "144h_high": None,
+        }
+    
+    def add_ratio(self, ratio: float):
+        """Add a new ratio measurement with current timestamp"""
+        now = datetime.now()
+        self.history.append((now, ratio))
+        
+        # Keep only last 144 hours of data (plus a small buffer)
+        cutoff = now - timedelta(hours=145)
+        while self.history and self.history[0][0] < cutoff:
+            self.history.popleft()
+    
+    def check_extremes(self, current_ratio: float) -> list[str]:
+        """Check if current ratio is a new low/high for any period.
+        Returns list of alert messages."""
+        alerts = []
+        now = datetime.now()
+        
+        periods = [
+            ("24h", 24),
+            ("72h", 72),
+            ("144h", 144)
+        ]
+        
+        for period_name, hours in periods:
+            cutoff = now - timedelta(hours=hours)
+            # Get all ratios within this period
+            period_ratios = [ratio for ts, ratio in self.history if ts >= cutoff]
+            
+            if not period_ratios:
+                continue  # Not enough data yet
+            
+            min_ratio = min(period_ratios)
+            max_ratio = max(period_ratios)
+            
+            # Check for new low
+            if current_ratio <= min_ratio:
+                low_key = f"{period_name}_low"
+                # Only alert if this is a different extreme than last time
+                if self.last_alerted[low_key] != current_ratio:
+                    alerts.append((
+                        f"BTC/ETH {period_name} 新低！",
+                        f"现值 ≈ {current_ratio:.2f} (过去{hours}小时最低)"
+                    ))
+                    self.last_alerted[low_key] = current_ratio
+            
+            # Check for new high
+            if current_ratio >= max_ratio:
+                high_key = f"{period_name}_high"
+                # Only alert if this is a different extreme than last time
+                if self.last_alerted[high_key] != current_ratio:
+                    alerts.append((
+                        f"BTC/ETH {period_name} 新高！",
+                        f"现值 ≈ {current_ratio:.2f} (过去{hours}小时最高)"
+                    ))
+                    self.last_alerted[high_key] = current_ratio
+        
+        return alerts
+
 # ==== 主逻辑 ====
 def main():
     btc_price, eth_price = fetch_prices()
@@ -56,8 +138,13 @@ def main():
     eth_slot = int(eth_price // ETH_STEP)  # 当前 ETH 所在整数档
     ratio = btc_price / eth_price           # BTC/ETH 比率
     ratio_slot = int(ratio / RATIO_STEP)    # 当前比率所在档位
+    
+    # Initialize ratio tracker
+    tracker = RatioTracker()
+    tracker.add_ratio(ratio)
+    
     print(f"[INIT] BTC ≈ ${btc_price:,.0f}  ETH ≈ ${eth_price:,.0f}  BTC/ETH ≈ {ratio:.2f}")
-    print("[READY] 已开始监控整数节点…")
+    print("[READY] 已开始监控整数节点和24h/72h/144h极值…")
     # Flush stdout
     sys.stdout.flush()
 
@@ -107,6 +194,14 @@ def main():
                 # Flush stdout
                 sys.stdout.flush()
                 ratio_slot = new_ratio_slot
+            
+            # 追踪比率历史并检查24h/72h/144h极值
+            tracker.add_ratio(ratio)
+            extreme_alerts = tracker.check_extremes(ratio)
+            for title, body in extreme_alerts:
+                bark_push(title, body)
+                print(f"[EXTREME] {title} {body}")
+                sys.stdout.flush()
 
         except Exception as e:
             print(f"[ERROR] {e}")
