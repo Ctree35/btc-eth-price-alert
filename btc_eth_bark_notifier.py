@@ -41,8 +41,9 @@ COINGECKO_URL = (
 # ==== 推送 ====
 def bark_push(title: str, body: str):
     # URL-encode title and body to handle special characters like "/"
-    encoded_title = quote(title)
-    encoded_body = quote(body)
+    # Use safe='' to encode ALL characters including "/"
+    encoded_title = quote(title, safe='')
+    encoded_body = quote(body, safe='')
     url = f"{BARK_BASE}/{BARK_KEY}/{encoded_title}/{encoded_body}"
     try:
         r = requests.get(url, timeout=8)
@@ -103,6 +104,14 @@ class RatioTracker:
             
             if not period_ratios:
                 continue  # Not enough data yet
+            
+            # Check if we have enough historical data for this period
+            # Need data spanning at least the full period to avoid false alerts
+            if self.history:
+                oldest_timestamp = self.history[0][0]
+                data_span = (now - oldest_timestamp).total_seconds() / 3600  # hours
+                if data_span < hours:
+                    continue  # Not enough historical data yet for this period
             
             min_ratio = min(period_ratios)
             max_ratio = max(period_ratios)
