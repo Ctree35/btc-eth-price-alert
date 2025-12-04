@@ -7,4 +7,9 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    volumes:
+      - price_data:/app/data
+
+volumes:
+  price_data:
 

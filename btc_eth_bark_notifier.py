@@ -4,6 +4,7 @@ btc_eth_bark_notifier.py
 当 BTC 到达新的整数千位 (n*1 000 USD)、
 或 ETH 到达新的整数百位 (n*100 USD)、
 或 BTC/ETH 比率到达新的 0.5 倍数档位时，
+或 BTC/ETH 比率达到24h/72h/144h新高/新低时，
 立刻通过 Bark 推送到 iPhone。
 
 依赖：
@@ -16,13 +17,15 @@ btc_eth_bark_notifier.py
     ETH_STEP      —— ETH 步长（默认 100）
     RATIO_STEP    —— BTC/ETH 比率步长（默认 0.5）
     INTERVAL      —— 轮询间隔（秒）
+    DB_PATH       —— SQLite数据库路径（默认 ratio_history.db）
+                     用于持久化BTC/ETH价格和比率历史数据，重启后不丢失
 """
 import os
 import sys
 import time
+import sqlite3
 import requests
 from urllib.parse import quote
-from collections import deque
 from datetime import datetime, timedelta
 
 # ==== 配置（可用环境变量覆盖） ====
@@ -32,6 +35,7 @@ BTC_STEP   = int(os.getenv("BTC_STEP",  1000))   # BTC 整数档位步长
 ETH_STEP   = int(os.getenv("ETH_STEP",   100))   # ETH 整数档位步长
 RATIO_STEP = float(os.getenv("RATIO_STEP", 0.5)) # BTC/ETH 比率步长
 INTERVAL   = int(os.getenv("INTERVAL",    30))   # 秒
+DB_PATH    = os.getenv("DB_PATH", "ratio_history.db")  # SQLite 数据库路径
 
 COINGECKO_URL = (
     "https://api.coingecko.com/api/v3/simple/price"
@@ -60,11 +64,11 @@ def fetch_prices() -> tuple[float, float]:
     data = r.json()
     return data["bitcoin"]["usd"], data["ethereum"]["usd"]
 
-# ==== 历史比率追踪 ====
-class RatioTracker:
-    def __init__(self):
-        # Store (timestamp, ratio) tuples for up to 144 hours
-        self.history = deque()
+# ==== 历史价格追踪（SQLite持久化） ====
+class PriceTracker:
+    def __init__(self, db_path: str = DB_PATH):
+        self.db_path = db_path
+        self._init_db()
         # Track last alerted extremes to avoid duplicate alerts
         self.last_alerted = {
             "24h_low": None,
@@ -74,71 +78,178 @@ class RatioTracker:
             "144h_low": None,
             "144h_high": None,
         }
+        self._load_last_alerted()
     
-    def add_ratio(self, ratio: float):
-        """Add a new ratio measurement with current timestamp"""
+    def _init_db(self):
+        """Initialize SQLite database and create tables if needed"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        # Table for price history (BTC, ETH, and ratio)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS price_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                btc_price REAL NOT NULL,
+                eth_price REAL NOT NULL,
+                ratio REAL NOT NULL
+            )
+        ''')
+        # Index for faster timestamp queries
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_price_timestamp ON price_history(timestamp)
+        ''')
+        # Table for last alerted values (persisted across restarts)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS last_alerted (
+                key TEXT PRIMARY KEY,
+                value REAL
+            )
+        ''')
+        conn.commit()
+        conn.close()
+    
+    def _load_last_alerted(self):
+        """Load last alerted values from database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT key, value FROM last_alerted')
+        for key, value in cursor.fetchall():
+            if key in self.last_alerted:
+                self.last_alerted[key] = value
+        conn.close()
+    
+    def _save_last_alerted(self, key: str, value: float):
+        """Save last alerted value to database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO last_alerted (key, value) VALUES (?, ?)
+        ''', (key, value))
+        conn.commit()
+        conn.close()
+    
+    def add_prices(self, btc_price: float, eth_price: float, ratio: float):
+        """Add new price measurements with current timestamp"""
         now = datetime.now()
-        self.history.append((now, ratio))
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
         
-        # Keep only last 144 hours of data (plus a small buffer)
-        cutoff = now - timedelta(hours=145)
-        while self.history and self.history[0][0] < cutoff:
-            self.history.popleft()
+        # Insert new prices and ratio
+        cursor.execute('''
+            INSERT INTO price_history (timestamp, btc_price, eth_price, ratio) VALUES (?, ?, ?, ?)
+        ''', (now.isoformat(), btc_price, eth_price, ratio))
+        
+        # Clean up old data (keep only last 145 hours)
+        cutoff = (now - timedelta(hours=145)).isoformat()
+        cursor.execute('DELETE FROM price_history WHERE timestamp < ?', (cutoff,))
+        
+        conn.commit()
+        conn.close()
     
-    def check_extremes(self, current_ratio: float) -> list[str]:
+    def _get_oldest_timestamp(self) -> datetime | None:
+        """Get the oldest timestamp in the database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT MIN(timestamp) FROM price_history')
+        result = cursor.fetchone()[0]
+        conn.close()
+        if result:
+            return datetime.fromisoformat(result)
+        return None
+    
+    def _get_period_ratios(self, hours: int) -> list[float]:
+        """Get all ratios within the specified period"""
+        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT ratio FROM price_history WHERE timestamp >= ?
+        ''', (cutoff,))
+        ratios = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        return ratios
+    
+    def check_extremes(self, current_ratio: float) -> list[tuple[str, str]]:
         """Check if current ratio is a new low/high for any period.
-        Returns list of alert messages."""
-        alerts = []
+        Returns list of alert messages (only longest period for each extreme type)."""
         now = datetime.now()
+        oldest_timestamp = self._get_oldest_timestamp()
         
+        if not oldest_timestamp:
+            return []
+        
+        data_span_hours = (now - oldest_timestamp).total_seconds() / 3600
+        
+        # Periods sorted from longest to shortest
         periods = [
-            ("24h", 24),
+            ("144h", 144),
             ("72h", 72),
-            ("144h", 144)
+            ("24h", 24)
         ]
         
+        # Track the longest period extreme for each type
+        longest_low = None   # (period_name, hours, current_ratio)
+        longest_high = None  # (period_name, hours, current_ratio)
+        
         for period_name, hours in periods:
-            cutoff = now - timedelta(hours=hours)
-            # Get all ratios within this period
-            period_ratios = [ratio for ts, ratio in self.history if ts >= cutoff]
+            # Skip if we don't have enough historical data
+            if data_span_hours < hours:
+                continue
             
+            period_ratios = self._get_period_ratios(hours)
             if not period_ratios:
-                continue  # Not enough data yet
-            
-            # Check if we have enough historical data for this period
-            # Need data spanning at least the full period to avoid false alerts
-            if self.history:
-                oldest_timestamp = self.history[0][0]
-                data_span = (now - oldest_timestamp).total_seconds() / 3600  # hours
-                if data_span < hours:
-                    continue  # Not enough historical data yet for this period
+                continue
             
             min_ratio = min(period_ratios)
             max_ratio = max(period_ratios)
             
-            # Check for new low
-            if current_ratio <= min_ratio:
+            # Check for new low (only if we haven't found a longer period low yet)
+            if longest_low is None and current_ratio <= min_ratio:
                 low_key = f"{period_name}_low"
-                # Only alert if this is a different extreme than last time
                 if self.last_alerted[low_key] != current_ratio:
-                    alerts.append((
-                        f"BTC/ETH {period_name} 新低！",
-                        f"现值 ≈ {current_ratio:.2f} (过去{hours}小时最低)"
-                    ))
-                    self.last_alerted[low_key] = current_ratio
+                    longest_low = (period_name, hours, current_ratio, low_key)
             
-            # Check for new high
-            if current_ratio >= max_ratio:
+            # Check for new high (only if we haven't found a longer period high yet)
+            if longest_high is None and current_ratio >= max_ratio:
                 high_key = f"{period_name}_high"
-                # Only alert if this is a different extreme than last time
                 if self.last_alerted[high_key] != current_ratio:
-                    alerts.append((
-                        f"BTC/ETH {period_name} 新高！",
-                        f"现值 ≈ {current_ratio:.2f} (过去{hours}小时最高)"
-                    ))
-                    self.last_alerted[high_key] = current_ratio
+                    longest_high = (period_name, hours, current_ratio, high_key)
+        
+        # Build alerts for the longest periods only
+        alerts = []
+        
+        if longest_low:
+            period_name, hours, ratio_val, low_key = longest_low
+            alerts.append((
+                f"BTC/ETH {period_name} 新低！",
+                f"现值 ≈ {ratio_val:.2f} (过去{hours}小时最低)"
+            ))
+            self.last_alerted[low_key] = ratio_val
+            self._save_last_alerted(low_key, ratio_val)
+        
+        if longest_high:
+            period_name, hours, ratio_val, high_key = longest_high
+            alerts.append((
+                f"BTC/ETH {period_name} 新高！",
+                f"现值 ≈ {ratio_val:.2f} (过去{hours}小时最高)"
+            ))
+            self.last_alerted[high_key] = ratio_val
+            self._save_last_alerted(high_key, ratio_val)
         
         return alerts
+    
+    def get_data_info(self) -> str:
+        """Get info about stored data for display"""
+        oldest = self._get_oldest_timestamp()
+        if not oldest:
+            return "无历史数据"
+        data_span = (datetime.now() - oldest).total_seconds() / 3600
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM price_history')
+        count = cursor.fetchone()[0]
+        conn.close()
+        return f"历史数据: {count}条记录, 跨度{data_span:.1f}小时"
 
 # ==== 主逻辑 ====
 def main():
@@ -148,11 +259,11 @@ def main():
     ratio = btc_price / eth_price           # BTC/ETH 比率
     ratio_slot = int(ratio / RATIO_STEP)    # 当前比率所在档位
     
-    # Initialize ratio tracker
-    tracker = RatioTracker()
-    tracker.add_ratio(ratio)
+    # Initialize price tracker (loads historical data from SQLite)
+    tracker = PriceTracker()
     
     print(f"[INIT] BTC ≈ ${btc_price:,.0f}  ETH ≈ ${eth_price:,.0f}  BTC/ETH ≈ {ratio:.2f}")
+    print(f"[DB] {tracker.get_data_info()}")
     print("[READY] 已开始监控整数节点和24h/72h/144h极值…")
     # Flush stdout
     sys.stdout.flush()
@@ -204,8 +315,8 @@ def main():
                 sys.stdout.flush()
                 ratio_slot = new_ratio_slot
             
-            # 追踪比率历史并检查24h/72h/144h极值
-            tracker.add_ratio(ratio)
+            # 追踪价格历史并检查24h/72h/144h极值
+            tracker.add_prices(btc_price, eth_price, ratio)
             extreme_alerts = tracker.check_extremes(ratio)
             for title, body in extreme_alerts:
                 bark_push(title, body)
