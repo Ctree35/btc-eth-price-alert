@@ -169,9 +169,21 @@ class PriceTracker:
         conn.close()
         return ratios
     
+    def _get_shorter_period_keys(self, period_name: str, extreme_type: str) -> list[str]:
+        """Get all shorter period keys for a given period and extreme type.
+        For example, if period is '72h', returns ['24h_low'] or ['24h_high']"""
+        period_order = {"144h": 3, "72h": 2, "24h": 1}
+        current_order = period_order.get(period_name, 0)
+        shorter_keys = []
+        for pname, order in period_order.items():
+            if order < current_order:
+                shorter_keys.append(f"{pname}_{extreme_type}")
+        return shorter_keys
+    
     def check_extremes(self, current_ratio: float) -> list[tuple[str, str]]:
         """Check if current ratio is a new low/high for any period.
-        Returns list of alert messages (only longest period for each extreme type)."""
+        Returns list of alert messages (only longest period for each extreme type).
+        Also updates all shorter period extremes to prevent duplicate alerts."""
         now = datetime.now()
         oldest_timestamp = self._get_oldest_timestamp()
         
@@ -188,8 +200,8 @@ class PriceTracker:
         ]
         
         # Track the longest period extreme for each type
-        longest_low = None   # (period_name, hours, current_ratio)
-        longest_high = None  # (period_name, hours, current_ratio)
+        longest_low = None   # (period_name, hours, current_ratio, low_key)
+        longest_high = None  # (period_name, hours, current_ratio, high_key)
         
         for period_name, hours in periods:
             # Skip if we don't have enough historical data
@@ -224,8 +236,14 @@ class PriceTracker:
                 f"BTC/ETH {period_name} 新低！",
                 f"现值 ≈ {ratio_val:.2f} (过去{hours}小时最低)"
             ))
+            # Update the longest period
             self.last_alerted[low_key] = ratio_val
             self._save_last_alerted(low_key, ratio_val)
+            # Also update all shorter periods to prevent duplicate alerts
+            shorter_keys = self._get_shorter_period_keys(period_name, "low")
+            for key in shorter_keys:
+                self.last_alerted[key] = ratio_val
+                self._save_last_alerted(key, ratio_val)
         
         if longest_high:
             period_name, hours, ratio_val, high_key = longest_high
@@ -233,8 +251,14 @@ class PriceTracker:
                 f"BTC/ETH {period_name} 新高！",
                 f"现值 ≈ {ratio_val:.2f} (过去{hours}小时最高)"
             ))
+            # Update the longest period
             self.last_alerted[high_key] = ratio_val
             self._save_last_alerted(high_key, ratio_val)
+            # Also update all shorter periods to prevent duplicate alerts
+            shorter_keys = self._get_shorter_period_keys(period_name, "high")
+            for key in shorter_keys:
+                self.last_alerted[key] = ratio_val
+                self._save_last_alerted(key, ratio_val)
         
         return alerts
     
